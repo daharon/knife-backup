@@ -30,6 +30,7 @@ module ServerBackup
 
     deps do
       require 'fileutils'
+      require 'parallel'
       require 'chef/cookbook_loader'
     end
 
@@ -52,6 +53,14 @@ module ServerBackup
       :long => "--ignore-permissions",
       :description => "Continue in case a permission problem occurs",
       :boolean => true
+
+    option :concurrency,
+      :short => "-C NUM_PROCS",
+      :long => "--concurrency NUM_PROCS",
+      :description => "The number of concurrent connections",
+      :boolean => false,
+      :proc => Proc.new { |value| value.to_i },
+      :default => 1
 
     def run
       validate!
@@ -99,9 +108,9 @@ module ServerBackup
       ui.msg "Backing up data bags"
       dir = File.join(config[:backup_dir], "data_bags")
       FileUtils.mkdir_p(dir)
-      Chef::DataBag.list.each do |bag_name, url|
+      Parallel.map(Chef::DataBag.list, :in_processes => config[:concurrency]) do |bag_name, _|
         FileUtils.mkdir_p(File.join(dir, bag_name))
-        Chef::DataBag.load(bag_name).each do |item_name, url|
+        Chef::DataBag.load(bag_name).each do |item_name, _|
           ui.msg "Backing up data bag #{bag_name} item #{item_name}"
           item = Chef::DataBagItem.load(bag_name, item_name)
           File.open(File.join(dir, bag_name, "#{item_name}.json"), "w") do |dbag_file|
@@ -115,7 +124,7 @@ module ServerBackup
       ui.msg "Backing up #{component}"
       dir = File.join(config[:backup_dir], component)
       FileUtils.mkdir_p(dir)
-      klass.list.each do |component_name, url|
+      Parallel.map(klass.list, :in_processes => config[:concurrency]) do |component_name, url|
         next if component == "environments" && component_name == "_default"
         ui.msg "Backing up #{component} #{component_name}"
         component_obj = load_object(klass, component_name).to_hash
@@ -155,19 +164,24 @@ module ServerBackup
       else
         cookbooks = rest.get_rest("/cookbooks?num_versions=all")
       end
+      cookbook_downloads = []
       cookbooks.keys.each do |cb|
-        ui.msg "Backing up cookbook #{cb}"
-        dld = Chef::Knife::CookbookDownload.new
         cookbooks[cb]['versions'].each do |ver|
+          dld = Chef::Knife::CookbookDownload.new
           dld.name_args = [cb, ver['version']]
           dld.config[:download_directory] = dir
           dld.config[:force] = true
-          begin
-            dld.run
-          rescue
-            ui.msg "Failed to download cookbook #{cb} version #{ver['version']}... Skipping"
-            FileUtils.rm_r(File.join(dir, cb + "-" + ver['version']))
-          end
+          cookbook_downloads << dld
+        end
+      end
+      ui.msg "#{cookbook_downloads.length} cookbook versions"
+      Parallel.map(cookbook_downloads, :in_processes => config[:concurrency]) do |dld|
+        ui.msg "Backing up cookbook %s version %s" % dld.name_args
+        begin
+          dld.run
+        rescue
+          ui.msg "Failed to download cookbook %s version %s... Skipping" % dld.name_args
+          FileUtils.rm_r(File.join(dir, "%s-%s" % dld.name_args))
         end
       end
     end
