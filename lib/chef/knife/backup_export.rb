@@ -19,10 +19,6 @@
 
 require 'chef/node'
 require 'chef/api_client'
-
-if Chef::VERSION =~ /^11\./
-  require 'chef/user'
-end
 require 'chef/knife/cookbook_download'
 
 module ServerBackup
@@ -81,7 +77,20 @@ module ServerBackup
     end
 
     def nodes
-      backup_standard("nodes", Chef::Node)
+      ui.msg "Backing up nodes"
+      dir = File.join(config[:backup_dir], "nodes")
+      FileUtils.mkdir_p(dir)
+      Parallel.map(Chef::Node.list, :in_processes => config[:concurrency]) do |node_name, url|
+        ui.msg "Backing up node #{node_name}"
+        component_obj = load_object(Chef::Node, node_name).for_json
+        unless component_obj
+          ui.error "Could not load Chef::Node #{node_name}."
+          next
+        end
+        File.open(File.join(dir, "#{node_name}.json"), "w") do |component_file|
+          component_file.print(JSON.pretty_generate(component_obj))
+        end
+      end
     end
 
     def clients
@@ -89,11 +98,8 @@ module ServerBackup
     end
 
     def users
-      if Chef::VERSION =~ /^1[1]\./
-        backup_standard("users", Chef::User)
-      else
-        ui.warn "users export only supported on chef == 11"
-      end
+      require 'chef/user_v1'
+      backup_standard("users", Chef::UserV1)
     end
 
     def roles
@@ -176,7 +182,6 @@ module ServerBackup
       end
       ui.msg "#{cookbook_downloads.length} cookbook versions"
       Parallel.map(cookbook_downloads, :in_processes => config[:concurrency]) do |dld|
-        ui.msg "Backing up cookbook %s version %s" % dld.name_args
         begin
           dld.run
         rescue
